@@ -5585,12 +5585,14 @@ def make_handler(svc: Service):
                                            "message": "image generation is not set up on this server (run setup "
                                                       "with --images qwen-image)"}})
                 return
-            job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
+            job = images_api.parse_request(req, gen.cfg, gen)  # ImageRequestError (a ValueError): 400
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
             print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
-                  f"seed {job['seed']}", flush=True)
+                  f"seed {job['seed']}"
+                  f"{f', building on an image at strength {job['strength']:g}' if job.get('init_image') else ''}",
+                  flush=True)
             try:
                 with images_api.gpu_turn(svc, gen, job, cancel) as policy:
                     images, figures = gen.run(job, cancel)

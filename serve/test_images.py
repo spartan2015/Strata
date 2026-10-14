@@ -66,6 +66,31 @@ class Request(unittest.TestCase):
             with self.subTest(req=req), self.assertRaises(images_api.ImageRequestError):
                 images_api.parse_request(req, self.CFG)
 
+    def test_image_field(self):
+        """An "image" to build on: base64, a data URL, or (with a store) a stored image's name."""
+        sys.path.insert(0, str(FAKE.parent))
+        import fake_sd_cli
+        png = fake_sd_cli.png(64, 64, 1, "base")
+        b64 = base64.b64encode(png).decode()
+        j = images_api.parse_request({"prompt": "x", "image": b64}, self.CFG)
+        self.assertEqual(j["init_image"], png)
+        self.assertEqual(j["strength"], images_api.DEFAULT_STRENGTH)
+        j = images_api.parse_request({"prompt": "x", "image": "data:image/png;base64," + b64, "strength": 0.4},
+                                     self.CFG)
+        self.assertEqual((j["init_image"], j["strength"]), (png, 0.4))
+        self.assertIsNone(images_api.parse_request({"prompt": "x"}, self.CFG)["init_image"])
+
+    def test_image_refused(self):
+        bad = [{"prompt": "x", "image": "not base64 !!"},                       # neither name, url nor base64
+               {"prompt": "x", "image": base64.b64encode(b"JPEGnotapng").decode()},  # decodes, but is not a PNG
+               {"prompt": "x", "image": "0" * 32 + ".png"},                      # no store behind a bare config
+               {"prompt": "x", "image": 5}, {"prompt": "x", "image": ""},
+               {"prompt": "x", "strength": 0}, {"prompt": "x", "strength": 1.5},
+               {"prompt": "x", "strength": "half"}, {"prompt": "x", "strength": True}]
+        for req in bad:
+            with self.subTest(req=req), self.assertRaises(images_api.ImageRequestError):
+                images_api.parse_request(req, self.CFG)
+
 
 class Command(unittest.TestCase):
     def test_the_model_cards_command(self):
@@ -85,6 +110,15 @@ class Command(unittest.TestCase):
                                            "seed": 1}, "x")
         self.assertNotIn("--sigmas", cmd)          # Turbo's sigmas are an 8-step schedule
         self.assertEqual(cmd[cmd.index("-b") + 1], "3")
+
+    def test_init_image_adds_sd_clis_pair(self):
+        """Building on an image adds sd-cli's own -i/--strength; without one the command is what it always was."""
+        cfg = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l"}
+        job = {"prompt": "p", "width": 512, "height": 512, "n": 1, "steps": 4, "seed": 1}
+        self.assertNotIn("-i", images_api.sd_cli_args(cfg, dict(job), "x"))
+        self.assertNotIn("--strength", images_api.sd_cli_args(cfg, dict(job), "x"))
+        cmd = images_api.sd_cli_args(cfg, dict(job, init_path="/w/init.png", strength=0.4), "x")
+        self.assertEqual(cmd[cmd.index("-i"):cmd.index("-i") + 4], ["-i", "/w/init.png", "--strength", "0.4"])
 
     def test_native_switch(self):
         cfg = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l", "native": True}
@@ -294,6 +328,49 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.get("/v1/images/files/" + names[0])[0], 404)   # keep_files 3: the oldest went
         self.assertEqual(self.get("/v1/images/files/../../setup.py")[0], 404)
         self.assertEqual(self.get("/v1/images/files/" + "0" * 32 + ".png")[0], 404)
+
+    def test_img2img_from_base64(self):
+        """A base64 "image" reaches sd-cli as -i/--strength; the staged copy goes when the job ends."""
+        sys.path.insert(0, str(FAKE.parent))
+        import fake_sd_cli
+        png = fake_sd_cli.png(64, 64, 7, "base")
+        args = Path(self.tmp.name) / "argv.json"
+        with mock.patch.dict(os.environ, {"FAKE_SD_ARGS": str(args)}):
+            code, body = self.post({"prompt": "the same sloth holding a balloon", "seed": 3,
+                                    "image": base64.b64encode(png).decode(), "strength": 0.4})
+        self.assertEqual(code, 200, body)
+        argv = json.loads(args.read_text())
+        init = argv[argv.index("-i") + 1]
+        self.assertTrue(init.endswith("init.png"), init)
+        self.assertEqual(argv[argv.index("--strength") + 1], "0.4")
+        self.assertEqual(body["strata"]["strength"], 0.4)
+        self.assertFalse(Path(init).exists())                              # removed with the job's directory
+        self.assertEqual([p.name for p in Path(self.svc.images.dir).iterdir()], [])
+
+    def test_img2img_from_a_stored_name(self):
+        """The name in a response_format url is enough to build on that image again."""
+        code, body = self.post({"prompt": "a lighthouse", "seed": 5, "response_format": "url"})
+        self.assertEqual(code, 200, body)
+        url = body["data"][0]["url"]
+        name = url.rsplit("/", 1)[1]
+        stored = self.svc.images.file(name).read_bytes()
+        self.assertEqual(images_api._init_image(url, self.svc.images), stored)     # the url's own bytes
+        self.assertEqual(images_api._init_image(name, self.svc.images), stored)    # and the bare name
+        args = Path(self.tmp.name) / "argv.json"
+        with mock.patch.dict(os.environ, {"FAKE_SD_ARGS": str(args)}):
+            code, body = self.post({"prompt": "the same lighthouse at dusk", "seed": 5, "image": url})
+        self.assertEqual(code, 200, body)
+        argv = json.loads(args.read_text())
+        self.assertTrue(argv[argv.index("-i") + 1].endswith("init.png"))           # a staged copy, not the store
+        self.assertEqual(self.svc.images.file(name).read_bytes(), stored)          # the store was only read
+        self.assertEqual(body["strata"]["strength"], images_api.DEFAULT_STRENGTH)
+
+    def test_img2img_refused(self):
+        self.assertEqual(self.post({"prompt": "x", "image": "0" * 32 + ".png"})[0], 400)         # never stored
+        self.assertEqual(self.post({"prompt": "x", "image": "not base64 !!"})[0], 400)
+        self.assertEqual(self.post({"prompt": "x", "image": base64.b64encode(b"not a png at all").decode()})[0], 400)
+        self.assertEqual(self.post({"prompt": "x", "image": base64.b64encode(b"\x89PNG\r\n\x1a\nx").decode(),
+                                    "strength": 3})[0], 400)
 
     def test_bad_request_and_failure(self):
         self.assertEqual(self.post({"prompt": "x", "size": "999x999"})[0], 400)

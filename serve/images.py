@@ -1,7 +1,11 @@
 """serve/images.py - image generation (Qwen-Image-2.1-Turbo) through stable-diffusion.cpp's sd-cli.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
-own fields seed and steps.  Each request runs one `sd-cli` process with the arguments the model's card gives for
+own fields seed and steps, and two more for building on an image you already have: "image" (a stored image's name, a
+"response_format": "url" link to one, or a base64 / data-URL PNG) with "strength" (how much of it to redraw, 0-1,
+default 0.75).  That is sd-cli's own --init-img / --strength pair; without "image" the request is text-to-image and
+the command is what it always was.
+Each request runs one `sd-cli` process with the arguments the model's card gives for
 stable-diffusion.cpp (8 steps, CFG 1, euler, Turbo's sigmas, --diffusion-fa) and returns the PNG files that process
 wrote, unchanged: an image from the API is byte for byte the image plain sd-cli writes with the same arguments.
 
@@ -47,6 +51,10 @@ SIZE_STEP = 32                     # sd.cpp's Qwen-Image-2.1 docs: dimensions di
 MIN_SIDE = 256
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.png$")
 STEP_LINE = re.compile(r"\|\s*(\d+)/(\d+)\s*-")      # sd.cpp's progress bar: "|====    | 3/8 - 14.1s/it"
+STORE_URL = re.compile(r"/v1/images/files/([0-9a-f]{32}\.png)/?$")
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+INIT_MAX_MIB = 32                   # a base64 "image" is capped once decoded (the body limit caps the request)
+DEFAULT_STRENGTH = 0.75             # sd-cli's own --strength default: how much of the init image to re-denoise
 
 
 class ImageRequestError(ValueError):
@@ -83,9 +91,42 @@ def _int_field(req: dict, key: str, lo: int, hi: int, default):
     return v
 
 
-def parse_request(req: dict, cfg: dict) -> dict:
+def _init_image(value, gen) -> bytes:
+    """The request's "image" field -> the PNG bytes to build on: a stored image name, a "response_format": "url"
+    link to one, or a base64 / data-URL PNG.  Refused unless it resolves to bytes with a PNG header."""
+    if not isinstance(value, str) or not value.strip():
+        raise ImageRequestError('image: a stored image name, a "url" from this server, or a base64 PNG')
+    value = value.strip()
+    name = value if FILE_NAME.match(value) else None
+    if name is None:
+        m = STORE_URL.search(value)
+        name = m.group(1) if m else None
+    if name is not None:
+        p = gen.file(name) if gen is not None else None
+        if p is None:
+            if gen is None:
+                raise ImageRequestError("image: this server has no image store to read from")
+            stays = "is cleared when the server restarts" if not gen.cfg.get("out_dir") else "survives a restart"
+            raise ImageRequestError(
+                f"image: no stored image {name} (the store keeps the newest {gen.keep_files} and {stays})")
+        data = p.read_bytes()
+    else:
+        b64 = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except ValueError:
+            raise ImageRequestError("image: not a stored name, a url from this server, or base64-encoded PNG") from None
+        if len(data) > INIT_MAX_MIB << 20:
+            raise ImageRequestError(f"image: at most {INIT_MAX_MIB} MiB once decoded")
+    if not data.startswith(PNG_MAGIC):
+        raise ImageRequestError("image: a PNG, the only format this endpoint returns")
+    return data
+
+
+def parse_request(req: dict, cfg: dict, gen=None) -> dict:
     """The fields of one /v1/images/generations request, checked.  Unknown OpenAI fields (quality, style, user,
-    background, moderation) are accepted and ignored; an output format other than PNG is refused."""
+    background, moderation) are accepted and ignored; an output format other than PNG is refused.  `gen` resolves
+    an "image" that names one of the server's own stored images."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -105,7 +146,16 @@ def parse_request(req: dict, cfg: dict) -> dict:
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
-    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "response_format": fmt}
+    init = _init_image(req["image"], gen) if req.get("image") is not None else None
+    strength = req.get("strength")
+    if strength is None:
+        strength = DEFAULT_STRENGTH
+    elif isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0.0 < float(strength) <= 1.0:
+        raise ImageRequestError("strength: a number above 0 up to 1 (how much of the image to redraw)")
+    else:
+        strength = float(strength)
+    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed,
+            "response_format": fmt, "init_image": init, "strength": strength}
 
 
 def sd_cli_args(cfg: dict, job: dict, out_pattern: str) -> list[str]:
@@ -122,6 +172,8 @@ def sd_cli_args(cfg: dict, job: dict, out_pattern: str) -> list[str]:
     if job["n"] > 1:
         cmd += ["-b", str(job["n"])]
     cmd += ["-o", out_pattern]
+    if job.get("init_path"):                    # build on a previous image: sd-cli re-denoises --strength of it
+        cmd += ["-i", str(job["init_path"]), "--strength", f"{job['strength']:g}"]
     cmd += [str(a) for a in (cfg.get("args") or [])]
     if cfg.get("native") is True:                   # Strata's DiT runner inside sd-cli (CUDA / HIP builds)
         cmd += ["--model-args", "qwen_image_2_1_native=1"]
@@ -222,6 +274,10 @@ class ImageGen:
         the GPU turn.  ImageJobFailed when sd-cli fails, times out or is cancelled."""
         work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
         pattern = str(work / "img_%d.png")
+        if job.get("init_image"):
+            init = work / "init.png"        # sd-cli reads a file; the job's own directory is removed with it
+            init.write_bytes(job["init_image"])
+            job["init_path"] = str(init)
         cmd = sd_cli_args(self.cfg, job, pattern)
         timeout = float(self.cfg.get("timeout_s") or 3600)
         logf = work / "sd-cli.log"
@@ -284,6 +340,8 @@ class ImageGen:
         figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
                    "backend": self.cfg.get("backend"), "quant": self.cfg.get("quant")}
+        if job.get("init_path"):
+            figures["strength"] = job["strength"]
         for key, pat in (("text_encode_ms", r"get_learned_condition completed, taking ([0-9.]+) ?ms"),
                          ("sampling_s", r"sampling completed, taking ([0-9.]+) ?s"),
                          ("vae_decode_s", r"decode_first_stage completed, taking ([0-9.]+) ?s")):
